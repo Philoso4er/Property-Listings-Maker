@@ -1,0 +1,6 @@
+{
+  "name": "Cinematic Property Video Studio",
+  "description": "An elegant property image-to-video editor. Upload static property listings, select customizable camera pans, and stitch clips together into fully downloadable cinematic property tours.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
