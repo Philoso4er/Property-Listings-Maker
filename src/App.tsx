@@ -855,15 +855,19 @@ export default function App() {
       img.crossOrigin = 'anonymous';
       img.src = url;
       img.onload = () => {
+        // Downscale large photos so the JSON payload stays well under the
+        // serverless request body limit (4.5 MB on Vercel).
+        const MAX_DIMENSION = 1600;
+        const scale = Math.min(1, MAX_DIMENSION / Math.max(img.width, img.height));
         const canvas = document.createElement('canvas');
-        canvas.width = img.width;
-        canvas.height = img.height;
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
         const ctx = canvas.getContext('2d');
         if (!ctx) {
           reject(new Error('Could not get 2D context'));
           return;
         }
-        ctx.drawImage(img, 0, 0);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
         try {
           const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
           resolve(dataUrl);
@@ -950,12 +954,11 @@ export default function App() {
     setSlides((prev) => [...prev, newSlide]);
     setSelectedSlideId(newId);
 
-    // Read file as Base64 and trigger generate-caption API!
-    const reader = new FileReader();
-    reader.onloadend = async () => {
-      const base64Image = reader.result as string;
+    // Downscale + encode the image as Base64 and trigger generate-caption API!
+    (async () => {
       setLoadingCaptions((prev) => ({ ...prev, [newId]: true }));
       try {
+        const base64Image = await getBase64FromImageUrl(fileUrl);
         const response = await fetch('/api/generate-caption', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -995,8 +998,7 @@ export default function App() {
       } finally {
         setLoadingCaptions((prev) => ({ ...prev, [newId]: false }));
       }
-    };
-    reader.readAsDataURL(file);
+    })();
   };
 
   const handleAddPresetSlide = (name: string, url: string) => {
