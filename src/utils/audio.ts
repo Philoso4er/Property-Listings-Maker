@@ -260,3 +260,64 @@ class TourSoundtrack {
 export const soundscape = new TourSoundtrack();
 // Separate instance used only while exporting so preview playback is unaffected.
 export const exportSoundscape = new TourSoundtrack();
+
+// Uploaded soundtrack (mp3/wav/m4a): HTMLAudioElement for preview, decoded buffer for export.
+class CustomSoundtrack {
+  private previewEl: HTMLAudioElement | null = null;
+  private previewUrl = '';
+  private exportCtx: AudioContext | null = null;
+  private exportSrc: AudioBufferSourceNode | null = null;
+
+  startPreview(url: string) {
+    if (this.previewEl && this.previewUrl === url) {
+      this.previewEl.play().catch(() => {});
+      return;
+    }
+    this.stopPreview();
+    this.previewEl = new Audio(url);
+    this.previewEl.loop = true;
+    this.previewEl.volume = 0.6;
+    this.previewUrl = url;
+    this.previewEl.play().catch((e) => console.warn('Custom audio preview blocked:', e));
+  }
+
+  stopPreview() {
+    if (this.previewEl) {
+      this.previewEl.pause();
+      this.previewEl = null;
+      this.previewUrl = '';
+    }
+  }
+
+  async startExport(url: string): Promise<MediaStream | null> {
+    this.stopExport();
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) return null;
+    const ctx = new AudioCtx();
+    this.exportCtx = ctx;
+    if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+    const buf = await ctx.decodeAudioData(await (await fetch(url)).arrayBuffer());
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.9;
+    const dest = ctx.createMediaStreamDestination();
+    src.connect(gain);
+    gain.connect(dest);
+    src.start();
+    this.exportSrc = src;
+    return dest.stream;
+  }
+
+  stopExport() {
+    try {
+      this.exportSrc?.stop();
+    } catch {}
+    this.exportSrc = null;
+    this.exportCtx?.close().catch(() => {});
+    this.exportCtx = null;
+  }
+}
+
+export const customAudio = new CustomSoundtrack();

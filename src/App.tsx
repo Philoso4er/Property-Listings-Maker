@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import * as Lucide from 'lucide-react';
 import { PropertySlide, PanType, MusicTrack, VideoFilter, VideoSettings } from './types';
 import { DEFAULT_SLIDES, PAN_OPTIONS, FILTER_OPTIONS, MUSIC_OPTIONS } from './constants';
-import { soundscape, exportSoundscape } from './utils/audio';
+import { soundscape, exportSoundscape, customAudio } from './utils/audio';
 import {
   loadDecodedImage,
   pickRecorderMimeType,
@@ -13,7 +13,8 @@ import {
 } from './utils/exporter';
 
 const END_CARD_DURATION = 3; // seconds
-const CAPTION_FALLBACK = 'Luxurious view showcasing exquisite architectural design.';
+const EXPORT_TAIL_PAD = 0.5; // seconds of held final frame so the recorder flushes the end card
+const AI_PLACEHOLDER_PREFIX = 'AI is analyzing';
 
 export default function App() {
   // 1. App States
@@ -38,7 +39,10 @@ export default function App() {
     captionStyle: 'elegant_glass',
     endCardEnabled: false,
     endCardBgColor: '#0f172a',
+    endCardAgencyName: '',
   });
+  const [customAudioName, setCustomAudioName] = useState<string>('');
+  const demosActive = useRef<boolean>(true);
   const [exportFormat, setExportFormat] = useState<ExportFormat>('mp4');
   const [exportStatus, setExportStatus] = useState<string>('');
   const [captionNotice, setCaptionNotice] = useState<string | null>(null);
@@ -129,15 +133,21 @@ export default function App() {
 
   // Synchronize soundtrack with play/pause and track settings
   useEffect(() => {
-    if (isPlaying && audioActive && settings.musicTrack !== 'none') {
+    if (isPlaying && audioActive && settings.musicTrack === 'custom' && settings.customAudioUrl) {
+      soundscape.stop();
+      customAudio.startPreview(settings.customAudioUrl);
+    } else if (isPlaying && audioActive && settings.musicTrack !== 'none' && settings.musicTrack !== 'custom') {
+      customAudio.stopPreview();
       soundscape.start(settings.musicTrack as any);
     } else {
       soundscape.stop();
+      customAudio.stopPreview();
     }
     return () => {
       soundscape.stop();
+      customAudio.stopPreview();
     };
-  }, [isPlaying, settings.musicTrack, audioActive]);
+  }, [isPlaying, settings.musicTrack, settings.customAudioUrl, audioActive]);
 
   // 4. Playback loop (silky smooth requestAnimationFrame)
   const animate = (timestamp: number) => {
@@ -269,12 +279,13 @@ export default function App() {
         ctx.drawImage(logo, (width - lw) / 2, (height - lh) / 2 - height * 0.04, lw, lh);
         textY = (height + lh) / 2 + height * 0.03;
       }
-      if (videoSettings.brandingText) {
+      const agencyName = (videoSettings.endCardAgencyName || '').trim();
+      if (agencyName) {
         ctx.fillStyle = '#ffffff';
         ctx.font = `600 ${Math.round(Math.min(width, height) * 0.045)}px "Montserrat", sans-serif`;
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText(videoSettings.brandingText, width / 2, textY);
+        ctx.fillText(agencyName, width / 2, textY);
       }
       ctx.restore();
       return;
@@ -750,10 +761,18 @@ export default function App() {
     if (!exportCtx) throw new Error('Could not create standard 2D context.');
     drawCanvasScene(exportCanvas, exportCtx, slidesList, 0, videoSettings, cache);
 
-    const stream = exportCanvas.captureStream(30);
+    // Manual frame capture: we push a frame on every render tick with requestFrame(), so still
+    // images (e.g. the end card) keep producing frames instead of being skipped by the browser.
+    const stream = exportCanvas.captureStream(0);
+    const canvasTrack = stream.getVideoTracks()[0] as MediaStreamTrack & { requestFrame?: () => void };
     let audioOn = false;
     if (videoSettings.musicTrack !== 'none') {
-      const audioStream = exportSoundscape.start(videoSettings.musicTrack as any, true);
+      const audioStream =
+        videoSettings.musicTrack === 'custom'
+          ? videoSettings.customAudioUrl
+            ? await customAudio.startExport(videoSettings.customAudioUrl)
+            : null
+          : exportSoundscape.start(videoSettings.musicTrack as any, true);
       audioStream?.getAudioTracks().forEach((t) => {
         stream.addTrack(t);
         audioOn = true;
@@ -776,14 +795,30 @@ export default function App() {
     setExportStatus('Recording in real time…');
     await new Promise<void>((resolve) => {
       let start = 0;
+      let frameNo = 0;
+      let lastFrameAt = -1;
       let done = false;
       let watchdog: ReturnType<typeof setInterval> | null = null;
       const tick = () => {
         if (done) return;
         const t = (performance.now() - start) / 1000;
         drawCanvasScene(exportCanvas, exportCtx, slidesList, Math.min(t, duration - 0.001), videoSettings, cache);
+        // captureStream only emits frames when pixels change, so a still end card would produce
+        // no frames and the MP4 muxer would end the track early. Toggle one near-invisible pixel.
+        frameNo++;
+        exportCtx.save();
+        exportCtx.globalAlpha = 0.02;
+        exportCtx.fillStyle = frameNo % 2 ? '#ffffff' : '#000000';
+        exportCtx.fillRect(w - 1, h - 1, 1, 1);
+        exportCtx.restore();
+        // Cap pushed frames at ~30 fps.
+        if (t - lastFrameAt >= 1 / 31 || t >= duration) {
+          lastFrameAt = t;
+          canvasTrack.requestFrame?.();
+        }
         onProgress(Math.min(99, Math.floor((t / duration) * 100)));
-        if (t >= duration) {
+        // Keep recording past the timeline end so the final frames (end card) are flushed.
+        if (t >= duration + EXPORT_TAIL_PAD) {
           done = true;
           if (watchdog) clearInterval(watchdog);
           resolve();
@@ -797,9 +832,36 @@ export default function App() {
       watchdog = setInterval(tick, 200);
       requestAnimationFrame(tick);
     });
+    // Flush: ask for the pending data, then stop and wait for the final dataavailable + onstop.
+    const finalData = new Promise<void>((resolve) => {
+      const prev = recorder.ondataavailable;
+      recorder.ondataavailable = (e) => {
+        prev?.call(recorder, e);
+        if (recorder.state === 'inactive') resolve();
+      };
+      setTimeout(resolve, 3000);
+    });
+    // Ask for pending data and wait for it to arrive before stopping.
+    await new Promise<void>((resolve) => {
+      const onData = () => {
+        recorder.removeEventListener('dataavailable', onData);
+        resolve();
+      };
+      recorder.addEventListener('dataavailable', onData);
+      setTimeout(onData, 1500);
+      try {
+        recorder.requestData();
+      } catch {
+        onData();
+      }
+    });
+    // Ending the video track lets the encoder flush its last frames into the muxer.
+    stream.getVideoTracks().forEach((t) => t.stop());
+    await new Promise((r) => setTimeout(r, 300));
     recorder.stop();
-    await stopped;
+    await Promise.all([stopped, finalData]);
     exportSoundscape.stop();
+    customAudio.stopExport();
     stream.getTracks().forEach((t) => t.stop());
 
     // 4) Package
@@ -942,7 +1004,7 @@ export default function App() {
             s.id === slideId
               ? {
                   ...s,
-                  caption: data.caption || s.caption,
+                  caption: typeof data.caption === 'string' ? data.caption : s.caption,
                   name: data.name || s.name,
                   panType: (data.panType as any) || s.panType,
                 }
@@ -959,7 +1021,7 @@ export default function App() {
       setCaptionNotice(`${err?.message || 'AI caption failed.'} You can type the caption manually.`);
       setSlides((prev) =>
         prev.map((s) =>
-          s.id === slideId && s.caption.startsWith('AI is analyzing') ? { ...s, caption: CAPTION_FALLBACK } : s
+          s.id === slideId && s.caption.startsWith(AI_PLACEHOLDER_PREFIX) ? { ...s, caption: '' } : s
         )
       );
     } finally {
@@ -982,8 +1044,12 @@ export default function App() {
       caption: 'AI is analyzing listing photo to generate a caption...',
     };
 
-    setSlides((prev) => [...prev, newSlide]);
+    // The first upload replaces the demo clips; they never come back afterwards.
+    const replaceDemos = demosActive.current;
+    demosActive.current = false;
+    setSlides((prev) => (replaceDemos ? [newSlide] : [...prev, newSlide]));
     setSelectedSlideId(newId);
+    if (replaceDemos) setCurrentTime(0);
 
     // Downscale + encode the image as Base64 and trigger generate-caption API!
     (async () => {
@@ -1005,7 +1071,8 @@ export default function App() {
               s.id === newId
                 ? {
                     ...s,
-                    caption: data.caption || s.caption,
+                    // Only fill in if the user hasn't edited/cleared the placeholder meanwhile.
+                    caption: s.caption.startsWith(AI_PLACEHOLDER_PREFIX) ? data.caption || '' : s.caption,
                     name: data.name || s.name,
                     panType: (data.panType as any) || s.panType,
                   }
@@ -1019,7 +1086,9 @@ export default function App() {
         console.error('Error auto generating caption for uploaded file:', err);
         setCaptionNotice(`${err?.message || 'AI caption failed.'} You can type the caption manually.`);
         setSlides((prev) =>
-          prev.map((s) => (s.id === newId ? { ...s, caption: CAPTION_FALLBACK } : s))
+          prev.map((s) =>
+            s.id === newId && s.caption.startsWith(AI_PLACEHOLDER_PREFIX) ? { ...s, caption: '' } : s
+          )
         );
       } finally {
         setLoadingCaptions((prev) => ({ ...prev, [newId]: false }));
@@ -1038,6 +1107,7 @@ export default function App() {
       caption: 'AI is analyzing preset photo to generate a caption...',
     };
 
+    demosActive.current = false;
     setSlides((prev) => [...prev, newSlide]);
     setSelectedSlideId(newId);
 
@@ -1177,6 +1247,7 @@ export default function App() {
               <input
                 type="file"
                 accept="image/*"
+                data-testid="slide-upload"
                 onChange={handleAddCustomSlide}
                 className="hidden"
               />
@@ -1932,7 +2003,29 @@ export default function App() {
                     {opt.label}
                   </option>
                 ))}
+                <option value="custom" disabled={!settings.customAudioUrl}>
+                  {customAudioName ? `Custom: ${customAudioName}` : 'Custom Upload (choose file below)'}
+                </option>
               </select>
+              <label className="flex items-center justify-center gap-1.5 border border-dashed border-slate-800 hover:border-indigo-500/50 bg-slate-950/50 hover:bg-slate-950 rounded-lg p-2 cursor-pointer text-slate-400 hover:text-slate-200 transition-all">
+                <Lucide.Music className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="text-[10px] font-medium truncate">
+                  {customAudioName ? `Replace audio (${customAudioName})` : 'Upload Soundtrack (MP3/WAV/M4A)'}
+                </span>
+                <input
+                  type="file"
+                  data-testid="custom-audio"
+                  accept="audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/mp4,audio/x-m4a,audio/aac,.mp3,.wav,.m4a"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (!file) return;
+                    if (settings.customAudioUrl) URL.revokeObjectURL(settings.customAudioUrl);
+                    setCustomAudioName(file.name);
+                    setSettings((prev) => ({ ...prev, musicTrack: 'custom', customAudioUrl: URL.createObjectURL(file) }));
+                  }}
+                />
+              </label>
             </div>
 
             {/* Select Instagram / Classic Filter */}
@@ -2044,6 +2137,14 @@ export default function App() {
               </label>
               {settings.endCardEnabled && (
                 <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3 flex flex-col gap-2">
+                  <input
+                    type="text"
+                    data-testid="end-card-name"
+                    value={settings.endCardAgencyName || ''}
+                    onChange={(e) => setSettings({ ...settings, endCardAgencyName: e.target.value })}
+                    placeholder="Agency name (optional)"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-indigo-500 transition-colors"
+                  />
                   <div className="flex items-center gap-2">
                     {settings.endCardLogoUrl ? (
                       <div
