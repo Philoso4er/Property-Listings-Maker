@@ -55,4 +55,7 @@ export interface VideoSettings {
   captionFont?: CaptionFont;
   captionAnimation?: CaptionAnimation;
   captionStyle?: CaptionStyle;
+  endCardEnabled?: boolean;
+  endCardLogoUrl?: string; // agency logo shown on the final still clip
+  endCardBgColor?: string;
 }
