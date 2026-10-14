@@ -17,7 +17,7 @@ export interface PropertySlide {
   caption: string; // text overlay
 }
 
-export type MusicTrack = 'luxury_lounge' | 'jazz_cafe' | 'corporate_clean' | 'none';
+export type MusicTrack = 'luxury_lounge' | 'jazz_cafe' | 'corporate_clean' | 'custom' | 'none';
 
 export type VideoFilter = 'none' | 'vintage' | 'warm' | 'cool' | 'vibrant' | 'monochrome';
 
@@ -58,4 +58,6 @@ export interface VideoSettings {
   endCardEnabled?: boolean;
   endCardLogoUrl?: string; // agency logo shown on the final still clip
   endCardBgColor?: string;
+  endCardAgencyName?: string;
+  customAudioUrl?: string; // object URL of an uploaded mp3/wav/m4a soundtrack
 }
