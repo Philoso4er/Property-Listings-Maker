@@ -35,8 +35,16 @@ class TourSoundtrack {
 
   constructor() {}
 
-  public start(track: 'luxury_lounge' | 'cinematic_vibe' | 'jazz_cafe' | 'corporate_clean') {
-    if (this.isPlaying && this.currentTrackName === track) return;
+  /**
+   * Start the soundtrack. When `exportMode` is true, the mix is routed into a
+   * MediaStreamAudioDestinationNode (and not the speakers) and its MediaStream is
+   * returned so it can be muxed into a MediaRecorder export.
+   */
+  public start(
+    track: 'luxury_lounge' | 'cinematic_vibe' | 'jazz_cafe' | 'corporate_clean',
+    exportMode: boolean = false
+  ): MediaStream | null {
+    if (!exportMode && this.isPlaying && this.currentTrackName === track) return null;
     this.stop();
 
     this.currentTrackName = track;
@@ -45,12 +53,22 @@ class TourSoundtrack {
     try {
       // Initialize context
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
+      if (!AudioCtx) return null;
       this.ctx = new AudioCtx();
-      
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+
       const mainGain = this.ctx.createGain();
       mainGain.gain.setValueAtTime(0.12, this.ctx.currentTime); // keep background music soft
-      mainGain.connect(this.ctx.destination);
+      let exportStream: MediaStream | null = null;
+      if (exportMode) {
+        const dest = this.ctx.createMediaStreamDestination();
+        // Louder for the exported file: the export has no other audio source.
+        mainGain.gain.setValueAtTime(0.5, this.ctx.currentTime);
+        mainGain.connect(dest);
+        exportStream = dest.stream;
+      } else {
+        mainGain.connect(this.ctx.destination);
+      }
 
       // Start dynamic noise generator for environmental wind/waves sweep
       this.startNoiseSweep(mainGain);
@@ -105,10 +123,12 @@ class TourSoundtrack {
       };
 
       this.melodyInterval = setInterval(playMelodyCycle, melodySpeed);
+      return exportStream;
 
     } catch (err) {
       console.warn('Web Audio initialization failed or was blocked by browser security policy:', err);
     }
+    return null;
   }
 
   private startNoiseSweep(output: AudioNode) {
@@ -238,3 +258,5 @@ class TourSoundtrack {
 }
 
 export const soundscape = new TourSoundtrack();
+// Separate instance used only while exporting so preview playback is unaffected.
+export const exportSoundscape = new TourSoundtrack();

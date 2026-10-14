@@ -2,7 +2,18 @@ import React, { useState, useEffect, useRef } from 'react';
 import * as Lucide from 'lucide-react';
 import { PropertySlide, PanType, MusicTrack, VideoFilter, VideoSettings } from './types';
 import { DEFAULT_SLIDES, PAN_OPTIONS, FILTER_OPTIONS, MUSIC_OPTIONS } from './constants';
-import { soundscape } from './utils/audio';
+import { soundscape, exportSoundscape } from './utils/audio';
+import {
+  loadDecodedImage,
+  pickRecorderMimeType,
+  convertWebmToMp4,
+  downloadBlob,
+  fixWebmDuration,
+  ExportFormat,
+} from './utils/exporter';
+
+const END_CARD_DURATION = 3; // seconds
+const CAPTION_FALLBACK = 'Luxurious view showcasing exquisite architectural design.';
 
 export default function App() {
   // 1. App States
@@ -25,7 +36,12 @@ export default function App() {
     captionFont: 'Playfair Display',
     captionAnimation: 'slide_up',
     captionStyle: 'elegant_glass',
+    endCardEnabled: false,
+    endCardBgColor: '#0f172a',
   });
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('mp4');
+  const [exportStatus, setExportStatus] = useState<string>('');
+  const [captionNotice, setCaptionNotice] = useState<string | null>(null);
 
   // AI Caption states
   const [loadingCaptions, setLoadingCaptions] = useState<Record<string, boolean>>({});
@@ -58,23 +74,37 @@ export default function App() {
   const requestRef = useRef<number | null>(null);
   const prevTimeRef = useRef<number | null>(null);
 
-  const totalDuration = slides.reduce((sum, s) => sum + s.duration, 0);
+  const slidesDuration = slides.reduce((sum, s) => sum + s.duration, 0);
+  const hasEndCard = !!settings.endCardEnabled && slides.length > 0;
+  const totalDuration = slidesDuration + (hasEndCard ? END_CARD_DURATION : 0);
   const activeSlide = slides.find((s) => s.id === selectedSlideId) || slides[0];
 
   // 3. Preload all slide images into memory
   useEffect(() => {
     slides.forEach((slide) => {
       if (!imageCache.current[slide.imageUrl]) {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.src = slide.imageUrl;
-        img.onload = () => {
-          imageCache.current[slide.imageUrl] = img;
-          triggerSingleFrame(); // redraw once loaded
-        };
+        loadDecodedImage(slide.imageUrl)
+          .then((img) => {
+            imageCache.current[slide.imageUrl] = img;
+            triggerSingleFrame(); // redraw once loaded
+          })
+          .catch((err) => console.error('Error preloading slide image:', err));
       }
     });
   }, [slides]);
+
+  // Preload end card logo if available
+  useEffect(() => {
+    const url = settings.endCardLogoUrl;
+    if (url && !imageCache.current[url]) {
+      loadDecodedImage(url)
+        .then((img) => {
+          imageCache.current[url] = img;
+          triggerSingleFrame();
+        })
+        .catch((err) => console.error('Error preloading end card logo:', err));
+    }
+  }, [settings.endCardLogoUrl]);
 
   // Preload custom watermark logo if available
   useEffect(() => {
@@ -217,6 +247,36 @@ export default function App() {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText('Drop or add images to begin building property video', width / 2, height / 2);
+      return;
+    }
+
+    // Optional end card: a still agency logo on a solid background after the last slide
+    const slidesTotal = slidesList.reduce((sum, sl) => sum + sl.duration, 0);
+    if (videoSettings.endCardEnabled && time >= slidesTotal) {
+      const local = time - slidesTotal;
+      ctx.fillStyle = videoSettings.endCardBgColor || '#0f172a';
+      ctx.fillRect(0, 0, width, height);
+      const logo = videoSettings.endCardLogoUrl ? imgCache[videoSettings.endCardLogoUrl] : undefined;
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, local / 0.5);
+      let textY = height / 2;
+      if (logo && logo.naturalWidth > 0) {
+        const maxW = width * 0.6;
+        const maxH = height * 0.35;
+        const sc = Math.min(maxW / logo.naturalWidth, maxH / logo.naturalHeight);
+        const lw = logo.naturalWidth * sc;
+        const lh = logo.naturalHeight * sc;
+        ctx.drawImage(logo, (width - lw) / 2, (height - lh) / 2 - height * 0.04, lw, lh);
+        textY = (height + lh) / 2 + height * 0.03;
+      }
+      if (videoSettings.brandingText) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = `600 ${Math.round(Math.min(width, height) * 0.045)}px "Montserrat", sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(videoSettings.brandingText, width / 2, textY);
+      }
+      ctx.restore();
       return;
     }
 
@@ -648,103 +708,141 @@ export default function App() {
     }
   };
 
-  // 6. Real-Time Offline Canvas Recording & Stitcher Exporter
+  // 6. Real-time Canvas Recording & Stitcher Exporter
+  // Frames are driven by a wall clock (performance.now + requestAnimationFrame), so each
+  // clip occupies exactly its set duration in the MediaRecorder output.
+  const getExportSize = () => {
+    if (settings.aspectRatio === '9:16') return { w: 720, h: 1280 };
+    if (settings.aspectRatio === '1:1') return { w: 1000, h: 1000 };
+    return { w: 1280, h: 720 };
+  };
+
+  const recordTimeline = async (opts: {
+    slidesList: PropertySlide[];
+    videoSettings: VideoSettings;
+    duration: number;
+    filenameBase: string;
+    onProgress: (pct: number) => void;
+  }) => {
+    const { slidesList, videoSettings, duration, filenameBase, onProgress } = opts;
+
+    // 1) Preload + decode every image before recording begins.
+    setExportStatus('Loading images…');
+    const urls = new Set<string>(slidesList.map((sl) => sl.imageUrl));
+    if (videoSettings.includeBranding && videoSettings.brandingLogoUrl) urls.add(videoSettings.brandingLogoUrl);
+    if (videoSettings.endCardEnabled && videoSettings.endCardLogoUrl) urls.add(videoSettings.endCardLogoUrl);
+    const cache: Record<string, HTMLImageElement> = { ...imageCache.current };
+    await Promise.all(
+      [...urls].map(async (url) => {
+        const existing = cache[url];
+        if (existing && existing.complete && existing.naturalWidth > 0) return;
+        cache[url] = await loadDecodedImage(url);
+        imageCache.current[url] = cache[url];
+      })
+    );
+
+    // 2) Canvas + streams
+    const { w, h } = getExportSize();
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = w;
+    exportCanvas.height = h;
+    const exportCtx = exportCanvas.getContext('2d');
+    if (!exportCtx) throw new Error('Could not create standard 2D context.');
+    drawCanvasScene(exportCanvas, exportCtx, slidesList, 0, videoSettings, cache);
+
+    const stream = exportCanvas.captureStream(30);
+    let audioOn = false;
+    if (videoSettings.musicTrack !== 'none') {
+      const audioStream = exportSoundscape.start(videoSettings.musicTrack as any, true);
+      audioStream?.getAudioTracks().forEach((t) => {
+        stream.addTrack(t);
+        audioOn = true;
+      });
+    }
+
+    const mimeType = pickRecorderMimeType(exportFormat);
+    const recorder = new MediaRecorder(stream, {
+      ...(mimeType ? { mimeType } : {}),
+      videoBitsPerSecond: 8_000_000,
+      ...(audioOn ? { audioBitsPerSecond: 160_000 } : {}),
+    });
+    const chunks: Blob[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    const stopped = new Promise<void>((resolve) => (recorder.onstop = () => resolve()));
+
+    // 3) Real-time render loop
+    setExportStatus('Recording in real time…');
+    await new Promise<void>((resolve) => {
+      let start = 0;
+      let done = false;
+      let watchdog: ReturnType<typeof setInterval> | null = null;
+      const tick = () => {
+        if (done) return;
+        const t = (performance.now() - start) / 1000;
+        drawCanvasScene(exportCanvas, exportCtx, slidesList, Math.min(t, duration - 0.001), videoSettings, cache);
+        onProgress(Math.min(99, Math.floor((t / duration) * 100)));
+        if (t >= duration) {
+          done = true;
+          if (watchdog) clearInterval(watchdog);
+          resolve();
+          return;
+        }
+        requestAnimationFrame(tick);
+      };
+      recorder.start(250);
+      start = performance.now();
+      // rAF is throttled in background tabs; keep the clock-driven loop moving anyway.
+      watchdog = setInterval(tick, 200);
+      requestAnimationFrame(tick);
+    });
+    recorder.stop();
+    await stopped;
+    exportSoundscape.stop();
+    stream.getTracks().forEach((t) => t.stop());
+
+    // 4) Package
+    const recordedType = (recorder.mimeType || mimeType || 'video/webm').split(';')[0];
+    let blob = new Blob(chunks, { type: recordedType });
+    let ext = recordedType.includes('mp4') ? 'mp4' : 'webm';
+    if (ext === 'webm') blob = await fixWebmDuration(blob, duration * 1000);
+    if (exportFormat === 'mp4' && ext !== 'mp4') {
+      try {
+        setExportStatus('Converting to MP4 (first use downloads ~30 MB encoder)…');
+        blob = await convertWebmToMp4(blob, (r) => onProgress(Math.floor(r * 100)));
+        ext = 'mp4';
+      } catch (convErr: any) {
+        console.error('MP4 conversion failed, falling back to WebM:', convErr);
+        setExportError('MP4 conversion failed in this browser — downloaded WebM instead.');
+      }
+    }
+    downloadBlob(blob, `${filenameBase}.${ext}`);
+    onProgress(100);
+    setExportStatus('');
+  };
+
   const handleExportVideo = async () => {
     if (slides.length === 0) return;
     handlePause();
     setIsExporting(true);
     setExportProgress(0);
     setExportError(null);
-
-    // Setup Canvas dimension based on selected layout
-    let exportW = 1280;
-    let exportH = 720;
-    if (settings.aspectRatio === '9:16') {
-      exportW = 720;
-      exportH = 1280;
-    } else if (settings.aspectRatio === '1:1') {
-      exportW = 1000;
-      exportH = 1000;
-    }
-
     try {
-      // Create hidden offscreen canvas
-      const exportCanvas = document.createElement('canvas');
-      exportCanvas.width = exportW;
-      exportCanvas.height = exportH;
-      const exportCtx = exportCanvas.getContext('2d');
-      if (!exportCtx) throw new Error('Could not create standard 2D context.');
-
-      // Capture canvas video stream
-      const stream = exportCanvas.captureStream(30); // 30 FPS
-      
-      // Determine mimetype support in current browser (WebM is widely supported natively)
-      let options = { mimeType: 'video/webm;codecs=vp9,opus' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm;codecs=vp8' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: '' }; // Fallback
-      }
-
-      const recorder = new MediaRecorder(stream, options);
-      const chunks: Blob[] = [];
-      
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunks.push(e.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const videoBlob = new Blob(chunks, { type: 'video/webm' });
-        const downloadUrl = URL.createObjectURL(videoBlob);
-        
-        // Auto download trigger
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        a.download = `property_cinematic_${settings.aspectRatio.replace(':', '_')}.webm`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setIsExporting(false);
-        setExportProgress(100);
-      };
-
-      // Start recording
-      recorder.start();
-
-      const fps = 30;
-      const totalFrames = Math.floor(totalDuration * fps);
-      let currentFrame = 0;
-
-      const renderNextExportFrame = () => {
-        if (currentFrame > totalFrames) {
-          recorder.stop();
-          return;
-        }
-
-        const virtualTime = currentFrame / fps;
-        drawCanvasScene(exportCanvas, exportCtx, slides, virtualTime, settings, imageCache.current);
-        
-        setExportProgress(Math.floor((currentFrame / totalFrames) * 100));
-        currentFrame++;
-
-        // Render continuously with quick setTimeouts to keep it asynchronous and responsive without blocking UI thread
-        setTimeout(renderNextExportFrame, 16); 
-      };
-
-      // Start the frame-by-frame renderer
-      renderNextExportFrame();
-
+      await recordTimeline({
+        slidesList: slides,
+        videoSettings: settings,
+        duration: totalDuration,
+        filenameBase: `property_cinematic_${settings.aspectRatio.replace(':', '_')}`,
+        onProgress: setExportProgress,
+      });
     } catch (err: any) {
       console.error(err);
-      setExportError(err.message || 'The browser blocked creating a MediaRecorder on canvas stream.');
+      exportSoundscape.stop();
+      setExportError(err?.message || 'The browser blocked creating a MediaRecorder on canvas stream.');
+    } finally {
       setIsExporting(false);
+      setExportStatus('');
     }
   };
 
@@ -752,99 +850,25 @@ export default function App() {
   const handleExportSingleClip = async (slideId: string) => {
     const slide = slides.find((s) => s.id === slideId);
     if (!slide) return;
-
     handlePause();
     setExportingClipId(slideId);
     setSingleExportProgress(0);
-
-    // Setup Canvas dimension based on selected layout
-    let exportW = 1280;
-    let exportH = 720;
-    if (settings.aspectRatio === '9:16') {
-      exportW = 720;
-      exportH = 1280;
-    } else if (settings.aspectRatio === '1:1') {
-      exportW = 1000;
-      exportH = 1000;
-    }
-
     try {
-      // Create hidden offscreen canvas
-      const exportCanvas = document.createElement('canvas');
-      exportCanvas.width = exportW;
-      exportCanvas.height = exportH;
-      const exportCtx = exportCanvas.getContext('2d');
-      if (!exportCtx) throw new Error('Could not create standard 2D context.');
-
-      // Capture canvas video stream
-      const stream = exportCanvas.captureStream(30); // 30 FPS
-      
-      let options = { mimeType: 'video/webm;codecs=vp9,opus' };
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm;codecs=vp8' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: 'video/webm' };
-      }
-      if (!MediaRecorder.isTypeSupported(options.mimeType)) {
-        options = { mimeType: '' }; // Fallback
-      }
-
-      const recorder = new MediaRecorder(stream, options);
-      const chunks: Blob[] = [];
-      
-      recorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunks.push(e.data);
-        }
-      };
-
-      recorder.onstop = () => {
-        const videoBlob = new Blob(chunks, { type: 'video/webm' });
-        const downloadUrl = URL.createObjectURL(videoBlob);
-        
-        // Auto download trigger
-        const a = document.createElement('a');
-        a.href = downloadUrl;
-        const sanitizedName = slide.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
-        a.download = `clip_${sanitizedName}_${settings.aspectRatio.replace(':', '_')}.webm`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-
-        setExportingClipId(null);
-        setSingleExportProgress(100);
-      };
-
-      // Start recording
-      recorder.start();
-
-      const fps = 30;
-      const totalFrames = Math.floor(slide.duration * fps);
-      let currentFrame = 0;
-
-      const renderNextExportFrame = () => {
-        if (currentFrame > totalFrames) {
-          recorder.stop();
-          return;
-        }
-
-        const virtualTime = currentFrame / fps;
-        // Pass ONLY this single slide to render it as an independent clip
-        drawCanvasScene(exportCanvas, exportCtx, [slide], virtualTime, settings, imageCache.current);
-        
-        setSingleExportProgress(Math.floor((currentFrame / totalFrames) * 100));
-        currentFrame++;
-
-        setTimeout(renderNextExportFrame, 16); 
-      };
-
-      renderNextExportFrame();
-
+      const sanitizedName = slide.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+      await recordTimeline({
+        slidesList: [slide],
+        videoSettings: { ...settings, endCardEnabled: false },
+        duration: slide.duration,
+        filenameBase: `clip_${sanitizedName}_${settings.aspectRatio.replace(':', '_')}`,
+        onProgress: setSingleExportProgress,
+      });
     } catch (err: any) {
       console.error(err);
-      alert(err.message || 'The browser blocked creating a MediaRecorder on canvas stream.');
+      exportSoundscape.stop();
+      alert(err?.message || 'The browser blocked creating a MediaRecorder on canvas stream.');
+    } finally {
       setExportingClipId(null);
+      setExportStatus('');
     }
   };
 
@@ -926,11 +950,18 @@ export default function App() {
           )
         );
       } else {
-        const errData = await response.json();
-        console.error('API Error auto-captioning:', errData.error);
+        const errData = await response.json().catch(() => ({}));
+        console.error('API Error auto-captioning:', response.status, errData?.error);
+        throw new Error(`AI caption service unavailable (HTTP ${response.status}).`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Error auto-captioning slide:', err);
+      setCaptionNotice(`${err?.message || 'AI caption failed.'} You can type the caption manually.`);
+      setSlides((prev) =>
+        prev.map((s) =>
+          s.id === slideId && s.caption.startsWith('AI is analyzing') ? { ...s, caption: CAPTION_FALLBACK } : s
+        )
+      );
     } finally {
       setLoadingCaptions((prev) => ({ ...prev, [slideId]: false }));
     }
@@ -982,19 +1013,14 @@ export default function App() {
             )
           );
         } else {
-          setSlides((prev) =>
-            prev.map((s) =>
-              s.id === newId
-                ? {
-                    ...s,
-                    caption: 'Luxurious view showcasing exquisite architectural design.',
-                  }
-                : s
-            )
-          );
+          throw new Error(`AI caption service unavailable (HTTP ${response.status}).`);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error('Error auto generating caption for uploaded file:', err);
+        setCaptionNotice(`${err?.message || 'AI caption failed.'} You can type the caption manually.`);
+        setSlides((prev) =>
+          prev.map((s) => (s.id === newId ? { ...s, caption: CAPTION_FALLBACK } : s))
+        );
       } finally {
         setLoadingCaptions((prev) => ({ ...prev, [newId]: false }));
       }
@@ -1544,8 +1570,11 @@ export default function App() {
                     />
                   </div>
 
+                  {exportStatus && (
+                    <p className="text-[10px] text-slate-300 font-mono mt-2">{exportStatus}</p>
+                  )}
                   <p className="text-[10px] text-slate-500 max-w-xs mt-3">
-                    We are compiling and panning your static frames frame-by-frame with high-fidelity vintage rendering into video clips. Please keep AI Studio tab open.
+                    Recording runs in real time ({formatTime(totalDuration)}s) — keep this tab visible. We are compiling and panning your static frames frame-by-frame with high-fidelity vintage rendering into video clips. Please keep AI Studio tab open.
                   </p>
                 </div>
               )}
@@ -2001,8 +2030,89 @@ export default function App() {
               )}
             </div>
 
+            {/* END CARD: agency logo still clip */}
+            <div className="border-t border-slate-800 pt-4 flex flex-col gap-2">
+              <label className="flex items-center justify-between text-xs text-slate-300 font-semibold cursor-pointer">
+                <span>End Card ({END_CARD_DURATION}s agency logo)</span>
+                <input
+                  type="checkbox"
+                  data-testid="end-card-toggle"
+                  checked={!!settings.endCardEnabled}
+                  onChange={(e) => setSettings({ ...settings, endCardEnabled: e.target.checked })}
+                  className="accent-indigo-500"
+                />
+              </label>
+              {settings.endCardEnabled && (
+                <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3 flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    {settings.endCardLogoUrl ? (
+                      <div
+                        className="relative w-12 h-12 rounded-lg border border-slate-800 overflow-hidden shrink-0 flex items-center justify-center p-1 group"
+                        style={{ background: settings.endCardBgColor }}
+                      >
+                        <img src={settings.endCardLogoUrl} alt="End card logo" className="max-w-full max-h-full object-contain" />
+                        <button
+                          type="button"
+                          onClick={() => setSettings({ ...settings, endCardLogoUrl: undefined })}
+                          className="absolute inset-0 bg-slate-950/90 flex items-center justify-center text-rose-500 text-[8px] font-extrabold opacity-0 group-hover:opacity-100 transition-opacity"
+                        >
+                          REMOVE
+                        </button>
+                      </div>
+                    ) : (
+                      <label className="flex-1 flex items-center justify-center gap-1.5 border border-dashed border-slate-800 hover:border-indigo-500/50 bg-slate-950/50 rounded-lg p-2 cursor-pointer text-slate-400 hover:text-slate-200 transition-all">
+                        <Lucide.UploadCloud className="w-3.5 h-3.5 text-indigo-400" />
+                        <span className="text-[10px] font-medium">Upload Agency Logo</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          data-testid="end-card-logo"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (!file) return;
+                            const reader = new FileReader();
+                            reader.onloadend = () =>
+                              setSettings((prev) => ({ ...prev, endCardLogoUrl: reader.result as string }));
+                            reader.readAsDataURL(file);
+                          }}
+                        />
+                      </label>
+                    )}
+                    <label className="flex items-center gap-1.5 text-[10px] text-slate-400">
+                      Background
+                      <input
+                        type="color"
+                        value={settings.endCardBgColor || '#0f172a'}
+                        onChange={(e) => setSettings({ ...settings, endCardBgColor: e.target.value })}
+                        className="w-7 h-7 bg-transparent border border-slate-800 rounded cursor-pointer"
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+            </div>
+
             {/* MAJOR TRIGGER: EXPORT CINEMATIC VIDEO */}
             <div className="border-t border-slate-800 pt-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] font-bold text-slate-500 uppercase">Export Format</span>
+                <div className="flex bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+                  {(['mp4', 'webm'] as ExportFormat[]).map((f) => (
+                    <button
+                      key={f}
+                      type="button"
+                      data-testid={`format-${f}`}
+                      onClick={() => setExportFormat(f)}
+                      className={`px-3 py-1 rounded-md text-[10px] font-bold uppercase transition-colors ${
+                        exportFormat === f ? 'bg-indigo-500 text-white' : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {f}
+                    </button>
+                  ))}
+                </div>
+              </div>
               <button
                 onClick={handleExportVideo}
                 disabled={isExporting || slides.length === 0}
@@ -2021,6 +2131,12 @@ export default function App() {
                 )}
               </button>
               
+              {captionNotice && (
+                <div className="mt-2 text-[10px] text-amber-400 font-medium flex items-start justify-between gap-2">
+                  <span>{captionNotice}</span>
+                  <button type="button" onClick={() => setCaptionNotice(null)} className="text-slate-500 hover:text-slate-300">✕</button>
+                </div>
+              )}
               {exportError && (
                 <div className="mt-2 text-[10px] text-rose-400 font-medium">
                   Error: {exportError}
