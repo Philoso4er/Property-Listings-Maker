@@ -1574,7 +1574,7 @@ export default function App() {
                     <p className="text-[10px] text-slate-300 font-mono mt-2">{exportStatus}</p>
                   )}
                   <p className="text-[10px] text-slate-500 max-w-xs mt-3">
-                    Recording runs in real time ({formatTime(totalDuration)}s) — keep this tab visible. We are compiling and panning your static frames frame-by-frame with high-fidelity vintage rendering into video clips. Please keep AI Studio tab open.
+                    Recording runs in real time ({formatTime(totalDuration)}s) — keep this tab visible. We are compiling and panning your static frames frame-by-frame with high-fidelity vintage rendering into video clips.
                   </p>
                 </div>
               )}
